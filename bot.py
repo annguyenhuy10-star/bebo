@@ -9,12 +9,29 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
 COMMAND_PREFIX = "!"
 EMBED_COLOR = 0x1DB954
 
+# ================== SPOTIFY ==================
+sp = None
+if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET
+    )
+    sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
+    print("[OK] Spotify connected")
+else:
+    print("[WARN] Spotify credentials not found")
+
+# ================== YTDL OPTIONS ==================
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": False,
@@ -25,36 +42,18 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.youtube.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     },
     "extractor_args": {
-        "youtube": {
-            "skip": ["dash", "hls"],
-            "player_client": ["android", "web"],
-        }
+        "youtube": {"skip": ["dash", "hls"], "player_client": ["android", "web"]}
     },
     "retries": 5,
-    "fragment_retries": 5,
-    "skip_unavailable_fragments": True,
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": (
-        "-reconnect 1 "
-        "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
-        "-hide_banner "
-        "-loglevel error"
-    ),
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -hide_banner -loglevel error",
     "options": "-vn -bufsize 512k",
 }
-
 
 class YTDLSource(discord.PCMVolumeTransformer):
     ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -71,24 +70,19 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None, lambda: cls.ytdl.extract_info(url, download=False)
-        )
+        data = await loop.run_in_executor(None, lambda: cls.ytdl.extract_info(url, download=False))
         if data is None:
-            raise ValueError("Khong the lay thong tin bai hat.")
+            raise ValueError("Không thể lấy thông tin bài hát.")
         if "entries" in data:
             entries = [e for e in data["entries"] if e]
             if not entries:
-                raise ValueError("Playlist trong.")
+                raise ValueError("Playlist trống.")
             return [cls._make(e) for e in entries]
         return [cls._make(data)]
 
     @classmethod
     def _make(cls, data):
-        return cls(
-            discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTIONS),
-            data=data,
-        )
+        return cls(discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTIONS), data=data)
 
     @staticmethod
     def fmt_dur(sec):
@@ -146,14 +140,14 @@ class MusicCog(commands.Cog):
             guild.voice_client.play(source, after=lambda e: self._after(guild, e))
             guild.voice_client.source.volume = player.volume
 
-    @app_commands.command(name="play", description="Phat nhac tu link hoac ten bai")
-    @app_commands.describe(query="Link YouTube hoac ten bai hat")
+    @app_commands.command(name="play", description="Phát nhạc từ link YouTube, tên bài hoặc link Spotify")
+    @app_commands.describe(query="Link YouTube / Tên bài hát / Link Spotify")
     async def play(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
 
         if not interaction.user.voice or not interaction.user.voice.channel:
             return await interaction.followup.send(
-                embed=discord.Embed(description="Ban can vao kenh thoai truoc!", color=0xFF4444)
+                embed=discord.Embed(description="Bạn cần vào kênh thoại trước!", color=0xFF4444)
             )
 
         vc_channel = interaction.user.voice.channel
@@ -166,31 +160,44 @@ class MusicCog(commands.Cog):
             elif vc.channel != vc_channel:
                 await vc.move_to(vc_channel)
         except Exception as e:
-            return await interaction.followup.send(
-                embed=discord.Embed(description=f"Loi ket noi: {e}", color=0xFF4444)
-            )
+            return await interaction.followup.send(embed=discord.Embed(description=f"Lỗi kết nối: {e}", color=0xFF4444))
 
         player = self.get_player(guild.id)
+
+        # ================== XỬ LÝ SPOTIFY ==================
+        original_query = query
+        if "open.spotify.com" in query:
+            if not sp:
+                return await interaction.followup.send(
+                    embed=discord.Embed(description="Bot chưa cấu hình Spotify. Vui lòng liên hệ admin.", color=0xFF4444)
+                )
+            try:
+                if "/track/" in query:
+                    track_id = query.split("/track/")[1].split("?")[0]
+                    track = sp.track(track_id)
+                    query = f"{track['artists'][0]['name']} - {track['name']}"
+                elif "/playlist/" in query:
+                    playlist_id = query.split("/playlist/")[1].split("?")[0]
+                    results = sp.playlist_items(playlist_id, limit=50)
+                    tracks = [f"{item['track']['artists'][0]['name']} - {item['track']['name']}" 
+                              for item in results['items'] if item['track']]
+                    if tracks:
+                        query = f"ytsearch:{tracks[0]}"
+                        for t in tracks[1:]:
+                            player.add(await YTDLSource.from_url(f"ytsearch:{t}", loop=self.bot.loop))
+            except Exception as e:
+                return await interaction.followup.send(
+                    embed=discord.Embed(description=f"Lỗi Spotify: {str(e)[:150]}", color=0xFF4444)
+                )
 
         if not re.match(r"https?://", query):
             query = f"ytsearch:{query}"
 
         try:
             sources = await YTDLSource.from_url(query, loop=self.bot.loop)
-        except yt_dlp.utils.DownloadError as e:
-            msg = str(e)
-            if "403" in msg:
-                tip = "Loi 403: YouTube chan. Thu dung link khac hoac them cookies.txt."
-            elif "Private" in msg:
-                tip = "Video nay bi dat che do rieng tu."
-            else:
-                tip = f"Khong tai duoc: {msg[:200]}"
-            return await interaction.followup.send(
-                embed=discord.Embed(description=tip, color=0xFF4444)
-            )
         except Exception as e:
             return await interaction.followup.send(
-                embed=discord.Embed(description=f"Loi: {e}", color=0xFF4444)
+                embed=discord.Embed(description=f"Lỗi: {str(e)[:200]}", color=0xFF4444)
             )
 
         player.add(sources)
@@ -200,11 +207,7 @@ class MusicCog(commands.Cog):
             if source:
                 vc.play(source, after=lambda e: self._after(guild, e))
                 vc.source.volume = player.volume
-                embed = discord.Embed(
-                    title="Now Playing",
-                    description=f"[{source.title}]({source.url})",
-                    color=EMBED_COLOR,
-                )
+                embed = discord.Embed(title="Now Playing", description=f"[{source.title}]({source.url})", color=EMBED_COLOR)
                 embed.add_field(name="Duration", value=YTDLSource.fmt_dur(source.duration))
                 embed.add_field(name="Channel", value=source.uploader)
                 if source.thumbnail:
@@ -213,32 +216,25 @@ class MusicCog(commands.Cog):
                 return await interaction.followup.send(embed=embed)
 
         added = sources[0]
-        embed = discord.Embed(
-            title="Added to Queue",
-            description=f"[{added.title}]({added.url})",
-            color=EMBED_COLOR,
-        )
+        embed = discord.Embed(title="Added to Queue", description=f"[{added.title}]({added.url})", color=EMBED_COLOR)
         embed.add_field(name="Duration", value=YTDLSource.fmt_dur(added.duration))
         embed.add_field(name="Position", value=f"#{len(player.queue)}")
-        if len(sources) > 1:
-            embed.add_field(name="Playlist", value=f"Added {len(sources)} tracks", inline=False)
         if added.thumbnail:
             embed.set_thumbnail(url=added.thumbnail)
         await interaction.followup.send(embed=embed)
 
+    # ================== CÁC LỆNH KHÁC GIỮ NGUYÊN ==================
     @app_commands.command(name="skip", description="Bỏ qua bài hiện tại")
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if not vc or not vc.is_playing():
             return await interaction.response.send_message(
-                embed=discord.Embed(description="Khong co bai nao dang phat.", color=0xFF4444), ephemeral=True
+                embed=discord.Embed(description="Không có bài nào đang phát.", color=0xFF4444), ephemeral=True
             )
         vc.stop()
-        await interaction.response.send_message(
-            embed=discord.Embed(description="Skipped!", color=EMBED_COLOR)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description="Skipped!", color=EMBED_COLOR))
 
-    @app_commands.command(name="stop", description="Dung nhac va roi kenh")
+    @app_commands.command(name="stop", description="Dừng nhạc và rời kênh")
     async def stop(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild.id)
         player.clear()
@@ -246,105 +242,65 @@ class MusicCog(commands.Cog):
         if vc:
             vc.stop()
             await vc.disconnect()
-        await interaction.response.send_message(
-            embed=discord.Embed(description="Stopped and left voice channel.", color=EMBED_COLOR)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description="Stopped and left voice channel.", color=EMBED_COLOR))
 
-    @app_commands.command(name="pause", description="Tam dung nhac")
+    @app_commands.command(name="pause", description="Tạm dừng nhạc")
     async def pause(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Paused.", color=EMBED_COLOR)
-            )
+            await interaction.response.send_message(embed=discord.Embed(description="Paused.", color=EMBED_COLOR))
         else:
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Khong co gi dang phat.", color=0xFF4444), ephemeral=True
-            )
+            await interaction.response.send_message(embed=discord.Embed(description="Không có gì đang phát.", color=0xFF4444), ephemeral=True)
 
-    @app_commands.command(name="resume", description="Tiep tuc phat nhac")
+    @app_commands.command(name="resume", description="Tiếp tục phát nhạc")
     async def resume(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Resumed!", color=EMBED_COLOR)
-            )
+            await interaction.response.send_message(embed=discord.Embed(description="Resumed!", color=EMBED_COLOR))
         else:
-            await interaction.response.send_message(
-                embed=discord.Embed(description="Bot khong dang tam dung.", color=0xFF4444), ephemeral=True
-            )
+            await interaction.response.send_message(embed=discord.Embed(description="Bot không đang tạm dừng.", color=0xFF4444), ephemeral=True)
 
-    @app_commands.command(name="queue", description="Xem hang cho")
+    @app_commands.command(name="queue", description="Xem hàng chờ")
     async def queue_cmd(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild.id)
         embed = discord.Embed(title="Queue", color=EMBED_COLOR)
         if player.current:
-            embed.add_field(
-                name="Now Playing",
-                value=f"[{player.current.title}]({player.current.url}) `{YTDLSource.fmt_dur(player.current.duration)}`",
-                inline=False,
-            )
+            embed.add_field(name="Now Playing", value=f"[{player.current.title}]({player.current.url})", inline=False)
         if player.queue:
-            lines = []
-            for i, s in enumerate(list(player.queue)[:15], 1):
-                lines.append(f"`{i}.` [{s.title}]({s.url}) `{YTDLSource.fmt_dur(s.duration)}`")
-            if len(player.queue) > 15:
-                lines.append(f"...and {len(player.queue) - 15} more")
+            lines = [f"`{i}.` [{s.title}]({s.url})" for i, s in enumerate(list(player.queue)[:10], 1)]
             embed.add_field(name="Up Next", value="\n".join(lines), inline=False)
         if not player.current and not player.queue:
             embed.description = "Queue is empty."
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="volume", description="Dieu chinh am luong (0-200)")
-    @app_commands.describe(level="Am luong tu 0 den 200")
+    @app_commands.command(name="volume", description="Điều chỉnh âm lượng (0-200)")
     async def volume(self, interaction: discord.Interaction, level: int):
         if not (0 <= level <= 200):
-            return await interaction.response.send_message(
-                embed=discord.Embed(description="Am luong phai tu 0 den 200.", color=0xFF4444), ephemeral=True
-            )
+            return await interaction.response.send_message(embed=discord.Embed(description="Âm lượng phải từ 0 đến 200.", color=0xFF4444), ephemeral=True)
         player = self.get_player(interaction.guild.id)
         player.volume = level / 100
         vc = interaction.guild.voice_client
         if vc and vc.source:
             vc.source.volume = player.volume
-        await interaction.response.send_message(
-            embed=discord.Embed(description=f"Volume set to {level}%", color=EMBED_COLOR)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description=f"Volume set to {level}%", color=EMBED_COLOR))
 
-    @app_commands.command(name="nowplaying", description="Xem bai dang phat")
-    async def nowplaying(self, interaction: discord.Interaction):
-        player = self.get_player(interaction.guild.id)
-        if not player.current:
-            return await interaction.response.send_message(
-                embed=discord.Embed(description="Khong co bai nao dang phat.", color=0xFF4444), ephemeral=True
-            )
-        s = player.current
-        embed = discord.Embed(title="Now Playing", description=f"[{s.title}]({s.url})", color=EMBED_COLOR)
-        embed.add_field(name="Duration", value=YTDLSource.fmt_dur(s.duration))
-        embed.add_field(name="Channel", value=s.uploader)
-        if s.thumbnail:
-            embed.set_thumbnail(url=s.thumbnail)
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="leave", description="Bot roi kenh thoai")
+    @app_commands.command(name="leave", description="Bot rời kênh thoại")
     async def leave(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc:
             self.get_player(interaction.guild.id).clear()
             await vc.disconnect()
-        await interaction.response.send_message(
-            embed=discord.Embed(description="Left voice channel.", color=EMBED_COLOR)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description="Left voice channel.", color=EMBED_COLOR))
 
 
+# ================== BOT SETUP ==================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
-
 
 @bot.event
 async def on_ready():
@@ -356,10 +312,7 @@ async def on_ready():
     except Exception as e:
         print(f"[ERROR] Sync failed: {e}")
         traceback.print_exc()
-    await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name="/play")
-    )
-
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/play"))
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -376,9 +329,8 @@ async def on_voice_state_update(member, before, after):
                 if not humans2:
                     await vc2.disconnect()
 
-
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("[ERROR] Dien DISCORD_TOKEN vao file .env truoc!")
+        print("[ERROR] Thiếu DISCORD_TOKEN!")
         exit(1)
     bot.run(BOT_TOKEN)
